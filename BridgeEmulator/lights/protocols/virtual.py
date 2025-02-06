@@ -1,4 +1,5 @@
 import logManager
+import configManager
 
 logging = logManager.logger.get_logger(__name__)
 
@@ -13,7 +14,7 @@ def set_light(light, data):
     # Mark the virtual light as unreachable until at least one child is reachable
     light.state["reachable"] = False
 
-    from configManager.configHandler import bridgeConfig
+    bridgeConfig = configManager.bridgeConfig.yaml_config
 
     linked_lights = light.protocol_cfg["linked_lights"]
     for linked_id in linked_lights:
@@ -47,6 +48,8 @@ def get_light_state(light):
         return light.state  # just return parent's last known state
 
     linked_lights = light.protocol_cfg["linked_lights"]
+
+    bridgeConfig = configManager.bridgeConfig.yaml_config
 
     total_bri = 0
     on_count = 0
