@@ -119,6 +119,8 @@ def _retrieve_child_state(child_light):
 
     # Locate the child's protocol module
     selected_protocol = None
+        # Inline import to avoid circular references:
+    from lights.protocols import protocols
     for protocol_mod in protocols:
         # e.g. "lights.protocols.native_multi"
         if "lights.protocols." + protocol_name == protocol_mod.__name__:
