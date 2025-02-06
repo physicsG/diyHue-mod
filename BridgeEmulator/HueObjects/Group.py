@@ -300,6 +300,13 @@ class Group():
         result["id_v1"] = "/groups/" + self.id_v1
         result["on"] = {"on": self.update_state()["any_on"]}
         result["type"] = "grouped_light"
+
+        # Add entertainment capability so the group can sync with Ambilight
+        result["streaming"] = {
+            "renderer": True,  # This tells Hue Sync it can process entertainment data
+            "proxy": True  # Acts as a passthrough for individual lights
+        }
+
         if hasattr(self, "owner"):
             result["owner"] = {"rid": self.owner.username, "rtype": "device"}
         else:

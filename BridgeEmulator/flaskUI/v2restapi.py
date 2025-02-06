@@ -243,8 +243,11 @@ class ClipV2(Resource):
         data.append(v2HomeKit())
         # device
         data.append(v2BridgeDevice())
+        # lights
         for key, light in bridgeConfig["lights"].items():
-            data.append(light.getDevice())
+            data.append(light.getV2Api())
+        for key, group in bridgeConfig["groups"].items():
+            data.append(group.getV2GroupedLight())  # Add groups as lights
         for key, sensor in bridgeConfig["sensors"].items():
             if sensor.getDevice() != None:
                 data.append(sensor.getDevice())
@@ -335,6 +338,8 @@ class ClipV2Resource(Resource):
         elif resource == "light":
             for key, light in bridgeConfig["lights"].items():
                 response["data"].append(light.getV2Api())
+            for key, group in bridgeConfig["groups"].items():
+                response["data"].append(group.getV2GroupedLight())  # Add groups as lights
         elif resource == "room":
             for key, group in bridgeConfig["groups"].items():
                 if group.type == "Room":
