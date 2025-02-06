@@ -1,37 +1,36 @@
 import configManager
 import logManager
-from lights.protocols import protocols
 
 logging = logManager.logger.get_logger(__name__)
 
 bridgeConfig = configManager.bridgeConfig
 
-def set_light(light_obj, new_state):
+def set_light(light, data):
     """
     For a 'virtual' light, forward commands to each child in linked_lights.
     """
-    if "linked_lights" not in light_obj.protocol_cfg:
-        logging.warning(f"[virtual] No 'linked_lights' configured for {light_obj.name}.")
+    if "linked_lights" not in light.protocol_cfg:
+        logging.warning(f"[virtual] No 'linked_lights' configured for {light.name}.")
         return
 
     # Mark the virtual light as unreachable until at least one child is reachable
-    light_obj.state["reachable"] = False
+    light.state["reachable"] = False
 
-    linked_lights = light_obj.protocol_cfg["linked_lights"]
+    linked_lights = light.protocol_cfg["linked_lights"]
     for linked_id in linked_lights:
         child_light = bridgeConfig["lights"].get(linked_id)
         if child_light:
             try:
                 # Forward the same state changes to each child
-                child_light.setV1State(new_state, advertise=False)
+                child_light.setV1State(data, advertise=False)
                 # If any child is reachable, mark the parent as reachable
                 if child_light.state.get("reachable", False):
-                    light_obj.state["reachable"] = True
+                    light.state["reachable"] = True
             except Exception as e:
-                logging.warning(f"[virtual] Error updating child {linked_id} for {light_obj.name}: {e}")
+                logging.warning(f"[virtual] Error on child {linked_id} for {light.name}: {e}")
 
 
-def get_light_state(light_obj):
+def get_light_state(light):
     """
     For a 'virtual' light, we attempt to unify the states of its child lights.
 
@@ -44,11 +43,11 @@ def get_light_state(light_obj):
        - 'bri' is averaged across ALL children.
        - 'reachable' is True if ANY child is reachable.
     """
-    if "linked_lights" not in light_obj.protocol_cfg:
-        logging.warning(f"[virtual] No 'linked_lights' configured for {light_obj.name}.")
-        return light_obj.state  # just return parent's last known state
+    if "linked_lights" not in light.protocol_cfg:
+        logging.warning(f"[virtual] No 'linked_lights' configured for {light.name}.")
+        return light.state  # just return parent's last known state
 
-    linked_lights = light_obj.protocol_cfg["linked_lights"]
+    linked_lights = light.protocol_cfg["linked_lights"]
 
     total_bri = 0
     on_count = 0
@@ -84,7 +83,7 @@ def get_light_state(light_obj):
 
     # If no children, just return parent's last known state
     if child_count == 0:
-        return light_obj.state
+        return light.state
 
     # If any child is on, the parent is on
     parent_on = (on_count > 0)
@@ -98,12 +97,12 @@ def get_light_state(light_obj):
     parent_reachable = (reachable_count > 0)
 
     # Update the parent's local state
-    light_obj.state["on"] = parent_on
-    light_obj.state["bri"] = avg_bri
-    light_obj.state["reachable"] = parent_reachable
+    light.state["on"] = parent_on
+    light.state["bri"] = avg_bri
+    light.state["reachable"] = parent_reachable
 
     # Return the updated parent's state
-    return light_obj.state
+    return light.state
 
 
 def _retrieve_child_state(child_light):
