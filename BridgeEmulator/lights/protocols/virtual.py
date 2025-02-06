@@ -1,149 +1,161 @@
+import requests
 import logManager
-import configManager
-
 logging = logManager.logger.get_logger(__name__)
 
 def set_light(light, data):
     """
-    For a 'virtual' light, forward commands to each child in linked_lights.
+    1) For each linked child, figure out the child's IP, version, etc.
+    2) Batch them by IP, then do a single request per IP.
     """
+
+    # If the "virtual" light has no children, do nothing
     if "linked_lights" not in light.protocol_cfg:
         logging.warning(f"[virtual] No 'linked_lights' configured for {light.name}.")
         return
 
-    # Mark the virtual light as unreachable until at least one child is reachable
+    # We'll track sub-light updates in a dict keyed by the child's (ip, version, mac)
+    # or possibly just (ip). Here we assume (ip).
+    batch_updates = {}  # e.g. { "192.168.2.60:80": {"lights": {1: {...}, 2: {...}}} }
+
+    # Mark the virtual parent as unreachable until proven otherwise
     light.state["reachable"] = False
 
-    bridgeConfig = configManager.bridgeConfig.yaml_config
+    # STEP A: Collect updates
+    from configManager.configHandler import bridgeConfig
+    conf = bridgeConfig.yaml_config
+    child_ids = light.protocol_cfg["linked_lights"]
 
-    linked_lights = light.protocol_cfg["linked_lights"]
-    for linked_id in linked_lights:
-        child_light = bridgeConfig["lights"].get(linked_id)
-        if child_light:
-            try:
-                # Forward the same state changes to each child
-                child_light.setV1State(data, advertise=False)
-                # If any child is reachable, mark the parent as reachable
-                if child_light.state.get("reachable", False):
-                    light.state["reachable"] = True
-            except Exception as e:
-                logging.warning(f"[virtual] Error on child {linked_id} for {light.name}: {e}")
+    for child_id in child_ids:
+        child = conf["lights"].get(child_id)
+        if not child:
+            continue
 
+        # In a normal approach, you'd do child.setV1State(...). But that can spawn multiple requests.
+        # Instead, we'll parse the new_state ourselves & apply it to each child's sub-light data.
+
+        ip = child.protocol_cfg.get("ip")
+        light_nr = child.protocol_cfg.get("light_nr")
+
+        if not ip or not light_nr:
+            # fallback if missing something
+            continue
+
+        # We'll store minimal subset of fields. 
+        # If new_state includes "on", "bri", "xy", etc., put them in a sub-dict
+        # for example:
+        sub_light_data = {}
+
+        for k in ["on", "bri", "hue", "sat", "xy", "ct", "colormode"]:
+            if k in data:
+                sub_light_data[k] = data[k]
+
+        # Add to batch dict
+        if ip not in batch_updates:
+            batch_updates[ip] = { "lights": {} }
+        batch_updates[ip]["lights"][light_nr] = sub_light_data
+
+    # STEP B: Send each batch in a single PUT to the device’s /state endpoint
+    for device_ip, data_to_send in batch_updates.items():
+        try:
+            # e.g. requests.put(f"http://{device_ip}/state", json=data_to_send, timeout=2)
+            # Some native_multi expects a structure: { "lights": { "1": {...}, "2": {...} } }
+            r = requests.put(f"http://{device_ip}/state", json=data_to_send, timeout=2)
+            r.raise_for_status()  # raise error if 4xx/5xx
+            # If we succeed, we can mark parent reachable
+            light.state["reachable"] = True
+        except Exception as e:
+            logging.warning(f"[virtual] Batch update to {device_ip} failed: {e}")
 
 def get_light_state(light):
     """
-    For a 'virtual' light, we attempt to unify the states of its child lights.
+    Aggregated get_light_state() for a 'virtual' light referencing multiple sub-lights.
 
-    1. Call child protocol's get_light_state(child_light) if available.
-       Otherwise, use child_light.state.
-       If that's missing, default to a fallback (on=True, bri=254, reachable=True).
-
-    2. Simple aggregator logic:
-       - 'on' is True if ANY child is on.
-       - 'bri' is averaged across ALL children.
-       - 'reachable' is True if ANY child is reachable.
+    1. Group children by IP (native_multi device).
+    2. One GET request per IP to retrieve all sub-lights' states.
+    3. Update each child's in-memory state from the response.
+    4. Aggregate child's states into the virtual parent's overall state.
     """
+    # If this virtual light has no children, just return parent’s last known state
     if "linked_lights" not in light.protocol_cfg:
-        logging.warning(f"[virtual] No 'linked_lights' configured for {light.name}.")
-        return light.state  # just return parent's last known state
+        logging.warning(f"[virtual] No 'linked_lights' for {light.name}.")
+        return light.state
 
-    linked_lights = light.protocol_cfg["linked_lights"]
+    # We'll need to look up child lights from the global config
+    from configManager.configHandler import bridgeConfig
+    conf = bridgeConfig.yaml_config  # typically a dict with conf["lights"]
 
-    bridgeConfig = configManager.bridgeConfig.yaml_config
+    # Group child lights by IP
+    ip_map = {}  # { "192.168.2.60:80": [(child_light_obj, sub_light_number), ...], ... }
 
-    total_bri = 0
+    for cid in light.protocol_cfg["linked_lights"]:
+        child_light = conf["lights"].get(cid)
+        if not child_light:
+            continue
+
+        ip = child_light.protocol_cfg.get("ip")
+        ln = child_light.protocol_cfg.get("light_nr")
+        if not ip or not ln:
+            # If missing IP or light_nr, skip or handle differently
+            continue
+
+        if ip not in ip_map:
+            ip_map[ip] = []
+        ip_map[ip].append((child_light, ln))
+
+    # For each IP group, do a single GET to fetch the entire JSON state
+    for device_ip, child_pairs in ip_map.items():
+        try:
+            resp = requests.get(f"http://{device_ip}/state", timeout=3)
+            resp.raise_for_status()
+            device_data = resp.json()  # expected: { "lights": { "1": {...}, "2": {...}, ... } }
+
+            # Update each child's .state from the response
+            lights_data = device_data.get("lights", {})
+            for (child_obj, ln) in child_pairs:
+                sub_dict = lights_data.get(str(ln), {})
+                # For example, sub_dict might have keys: "on", "bri", "xy", "sat", etc.
+                # Copy relevant fields into child_obj.state
+                for key in ("on", "bri", "hue", "sat", "xy", "ct", "colormode", "reachable"):
+                    if key in sub_dict:
+                        child_obj.state[key] = sub_dict[key]
+
+                # If the device doesn’t provide "reachable", assume True if request succeeded
+                if "reachable" not in sub_dict:
+                    child_obj.state["reachable"] = True
+
+        except Exception as e:
+            logging.warning(f"[virtual] GET state failed for {device_ip}: {e}")
+            # Mark all children in that IP group unreachable if we want
+            for (child_obj, _) in child_pairs:
+                child_obj.state["reachable"] = False
+
+    # Now that each child’s .state is updated, let's unify them into the parent's .state.
+    # Example aggregator: parent "on" if ANY child is on; brightness = average of all kids, etc.
     on_count = 0
+    total_bri = 0
     reachable_count = 0
     child_count = 0
 
-    for linked_id in linked_lights:
-        child_light = bridgeConfig["lights"].get(linked_id)
+    for cid in light.protocol_cfg["linked_lights"]:
+        child_light = conf["lights"].get(cid)
         if not child_light:
-            # Child not found in config. Skip or handle differently if needed.
             continue
-
-        # Attempt to retrieve the child's current state
-        child_state = _retrieve_child_state(child_light)
-
         child_count += 1
 
-        # Is the child "on"?
-        if child_state.get("on", False):
+        if child_light.state.get("on"):
             on_count += 1
-
-        # Brightness
-        if "bri" in child_state and isinstance(child_state["bri"], int):
-            total_bri += child_state["bri"]
-        else:
-            # If "bri" is missing or invalid, you could default to 254 or skip it
-            pass
-
-        # Reachable
-        if child_state.get("reachable", True):
-            # If there's no explicit reachable, we assume True (per your request)
+        if "bri" in child_light.state:
+            total_bri += child_light.state["bri"]
+        # For reachability, if at least one is reachable, we can call the parent reachable
+        if child_light.state.get("reachable", False):
             reachable_count += 1
 
-    # If no children, just return parent's last known state
-    if child_count == 0:
-        return light.state
-
-    # If any child is on, the parent is on
-    parent_on = (on_count > 0)
-
-    # Calculate average brightness across all children
-    avg_bri = 1
     if child_count > 0:
-        avg_bri = int(total_bri / child_count)
+        parent_on = (on_count > 0)
+        parent_bri = int(total_bri / child_count)
+        parent_reachable = (reachable_count > 0)
+        light.state["on"] = parent_on
+        light.state["bri"] = parent_bri
+        light.state["reachable"] = parent_reachable
 
-    # If any child is reachable, parent is reachable
-    parent_reachable = (reachable_count > 0)
-
-    # Update the parent's local state
-    light.state["on"] = parent_on
-    light.state["bri"] = avg_bri
-    light.state["reachable"] = parent_reachable
-
-    # Return the updated parent's state
     return light.state
-
-
-def _retrieve_child_state(child_light):
-    """
-    Helper function:
-    1. Try child's protocol get_light_state() if that function is defined.
-    2. Otherwise use child_light.state (the in-memory state).
-    3. If even that is missing, default to an always-on, bright, reachable state.
-    """
-    protocol_name = child_light.protocol
-    child_state = None
-
-    # Locate the child's protocol module
-    selected_protocol = None
-        # Inline import to avoid circular references:
-    from lights.protocols import protocols
-    for protocol_mod in protocols:
-        # e.g. "lights.protocols.native_multi"
-        if "lights.protocols." + protocol_name == protocol_mod.__name__:
-            selected_protocol = protocol_mod
-            break
-
-    if selected_protocol and hasattr(selected_protocol, "get_light_state"):
-        # We can call the real protocol's get_light_state
-        try:
-            child_state = selected_protocol.get_light_state(child_light)
-        except Exception as e:
-            logging.warning(f"[virtual] Error calling get_light_state on child {child_light.name}: {e}")
-
-    # If the protocol didn't have get_light_state or it failed, fallback to child_light.state
-    if not child_state:
-        child_state = child_light.state
-
-    # If still no valid state, set a fallback
-    if not child_state:
-        child_state = {
-            "on": True,
-            "bri": 254,
-            "reachable": True
-        }
-
-    return child_state
